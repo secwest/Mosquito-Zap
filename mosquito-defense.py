@@ -13,7 +13,7 @@ CRITICAL FIXES APPLIED (v3.1):
 
 (C) Copyright 2025-07-08
 Author: Dragos Ruiu
-Version: 3.1
+Version: 3.2
 """
 
 import cv2
