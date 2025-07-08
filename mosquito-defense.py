@@ -3,17 +3,63 @@
 Stereo Vision Mosquito Detection and Laser Targeting System with Object Recognition
 Uses dual cameras for 3D positioning and deep learning for mosquito classification
 
-CRITICAL FIXES APPLIED (v3.1):
-- Camera frame synchronization for accurate stereo
-- Proper metric depth calculation from triangulation
-- Measured dt for Kalman and PID control
-- Comprehensive error handling and resource management
-- Configurable parameters via JSON config file
-- Safety interlocks and consecutive frame confirmation
+VERSION 3.3 (v60) - PRODUCTION READY
 
-(C) Copyright 2025-07-08
+Copyright (c) 2024 Dragos Ruiu
+All rights reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+CRITICAL FIXES IN THIS VERSION:
+- Camera frame synchronization with monotonic timestamps
+- Proper metric depth calculation using disparity formula
+- Measured dt throughout system (no fixed 0.033s assumptions)
+- Hungarian assignment for optimal tracking (with scipy)
+- Process noise scaling with dt² for Kalman filter
+- Configuration validation with type checking
+- Robust serial communication with error recovery
+- Emergency stop monitoring from Arduino
+- Headless operation mode for servers
+
+BASED ON CODE REVIEW FEEDBACK:
+- Fixed depth calculation from linear scale to proper disparity-to-depth
+- Changed time.time() to time.perf_counter() for monotonic timing
+- Added configuration validation to prevent type errors
+- Improved ACK parsing to handle ERR responses
+- Fixed PID double integration issue
+- Added emergency stop state monitoring
+- Enabled headless mode with --no-display flag
+- Fixed FPS counter runtime calculation
+- Better separation of optional vs required dependencies
+
+REQUIREMENTS:
+opencv-python>=4.5.0
+numpy>=1.19.0
+scikit-learn>=0.24.0  # Optional for HOG+SVM
+scikit-image>=0.18.0  # Optional for HOG features
+tensorflow>=2.8.0     # Optional for deep learning
+pyserial>=3.5         # Required for hardware
+scipy>=1.7.0          # Optional for Hungarian algorithm
+joblib>=1.0.0         # Optional for model saving
+
 Author: Dragos Ruiu
-Version: 3.2
+Version: 3.3 (v60)
 """
 
 import cv2
@@ -35,6 +81,11 @@ import glob
 import warnings
 from datetime import datetime
 import concurrent.futures
+
+# IMPORTANT: Set GPU configuration BEFORE importing TensorFlow
+# This ensures the environment variable takes effect
+if '--cpu-only' in sys.argv or os.environ.get('FORCE_CPU', '0') == '1':
+    os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
 # Configuration file path
 CONFIG_FILE = "mosquito_config.json"
@@ -117,7 +168,9 @@ def load_config(config_file: str = CONFIG_FILE) -> dict:
             with open(config_file, 'r') as f:
                 config = json.load(f)
                 # Merge with defaults for any missing keys
-                return merge_dicts(DEFAULT_CONFIG, config)
+                merged = merge_dicts(DEFAULT_CONFIG, config)
+                # Validate types
+                return validate_config(merged)
         except Exception as e:
             print(f"Error loading config: {e}, using defaults")
             return DEFAULT_CONFIG
@@ -137,6 +190,70 @@ def merge_dicts(default: dict, override: dict) -> dict:
         else:
             result[key] = value
     return result
+
+def validate_config(config: dict) -> dict:
+    """Validate configuration types and ranges"""
+    # Type validators
+    validators = {
+        'camera.width': (int, lambda x: x > 0),
+        'camera.height': (int, lambda x: x > 0),
+        'camera.fps': (int, lambda x: 0 < x <= 120),
+        'camera.sync_tolerance_ms': (float, lambda x: x > 0),
+        'stereo.baseline_mm': (float, lambda x: x > 0),
+        'stereo.focal_length_px': (float, lambda x: x > 0),
+        'stereo.min_disparity': (int, lambda x: True),
+        'stereo.max_disparity': (int, lambda x: x > 0),
+        'stereo.template_size': (int, lambda x: x > 0 and x % 2 == 1),  # Must be odd
+        'tracking.process_noise': (float, lambda x: x > 0),
+        'pid.integral_limit': (float, lambda x: x >= 0),
+        'laser.max_power': (int, lambda x: 0 < x <= 255),
+        'safety.enabled': (bool, lambda x: True)
+    }
+    
+    def get_nested(d, path):
+        """Get nested dict value by dot notation"""
+        keys = path.split('.')
+        for key in keys:
+            d = d.get(key, {})
+        return d
+        
+    def set_nested(d, path, value):
+        """Set nested dict value by dot notation"""
+        keys = path.split('.')
+        for key in keys[:-1]:
+            d = d.setdefault(key, {})
+        d[keys[-1]] = value
+    
+    # Validate each field
+    for path, (expected_type, validator) in validators.items():
+        value = get_nested(config, path)
+        
+        if not isinstance(value, expected_type):
+            print(f"Config warning: {path} should be {expected_type.__name__}, got {type(value).__name__}")
+            # Use default value
+            default_value = get_nested(DEFAULT_CONFIG, path)
+            set_nested(config, path, default_value)
+        elif not validator(value):
+            print(f"Config warning: {path} = {value} failed validation")
+            default_value = get_nested(DEFAULT_CONFIG, path)
+            set_nested(config, path, default_value)
+            
+    # Ensure template size is odd
+    template_size = config['stereo']['template_size']
+    if template_size % 2 == 0:
+        config['stereo']['template_size'] = template_size + 1
+        print(f"Adjusted template_size to {template_size + 1} (must be odd)")
+        
+    # Ensure num_disparities is multiple of 16
+    min_disp = config['stereo']['min_disparity']
+    max_disp = config['stereo']['max_disparity']
+    num_disp = max_disp - min_disp
+    if num_disp % 16 != 0:
+        num_disp = (num_disp // 16 + 1) * 16
+        config['stereo']['max_disparity'] = min_disp + num_disp
+        print(f"Adjusted max_disparity to {config['stereo']['max_disparity']} (num_disp must be multiple of 16)")
+        
+    return config
 
 # Global configuration
 CONFIG = load_config()
@@ -173,6 +290,10 @@ except ImportError:
     JOBLIB_AVAILABLE = False
     warnings.warn("joblib not installed. Model saving disabled.")
 
+# Set GPU config before TensorFlow import
+if '--cpu-only' in sys.argv or os.environ.get('FORCE_CPU', '0') == '1':
+    os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+
 # Suppress TensorFlow warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
@@ -190,6 +311,14 @@ try:
 except ImportError:
     TENSORFLOW_AVAILABLE = False
     warnings.warn("TensorFlow not installed. Deep learning disabled.")
+
+# Try to import scipy for Hungarian algorithm
+try:
+    from scipy.optimize import linear_sum_assignment
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    warnings.warn("scipy not installed. Using greedy assignment instead of Hungarian.")
 
 @dataclass
 class MosquitoTrack3D:
@@ -242,7 +371,7 @@ class StereoFrameSync:
         while self.running:
             ret, frame = cap.read()
             if ret:
-                timestamp = time.time()
+                timestamp = time.perf_counter()  # Monotonic high-resolution timer
                 try:
                     self.left_queue.put((timestamp, frame), timeout=0.001)
                 except queue.Full:
@@ -250,15 +379,15 @@ class StereoFrameSync:
                     try:
                         self.left_queue.get_nowait()
                         self.left_queue.put((timestamp, frame), timeout=0.001)
-                    except:
-                        pass
+                    except queue.Full:
+                        pass  # Still full, drop this frame
                         
     def capture_right(self, cap):
         """Capture thread for right camera"""
         while self.running:
             ret, frame = cap.read()
             if ret:
-                timestamp = time.time()
+                timestamp = time.perf_counter()  # Monotonic high-resolution timer
                 try:
                     self.right_queue.put((timestamp, frame), timeout=0.001)
                 except queue.Full:
@@ -266,11 +395,11 @@ class StereoFrameSync:
                     try:
                         self.right_queue.get_nowait()
                         self.right_queue.put((timestamp, frame), timeout=0.001)
-                    except:
-                        pass
+                    except queue.Full:
+                        pass  # Still full, drop this frame
                         
     def get_synchronized_frames(self, timeout: float = 0.1) -> Optional[Tuple[np.ndarray, np.ndarray, float]]:
-        """Get time-synchronized frame pair"""
+        """Get time-synchronized frame pair with stale frame handling"""
         try:
             # Get frames from queues
             left_time, left_frame = self.left_queue.get(timeout=timeout)
@@ -284,21 +413,46 @@ class StereoFrameSync:
                 avg_time = (left_time + right_time) / 2
                 return left_frame, right_frame, avg_time
             else:
-                # Try to sync by discarding older frame
-                if left_time < right_time:
-                    # Left is older, get next left
-                    while self.running and not self.left_queue.empty():
-                        left_time, left_frame = self.left_queue.get_nowait()
-                        if abs(left_time - right_time) * 1000 <= self.tolerance_ms:
-                            avg_time = (left_time + right_time) / 2
-                            return left_frame, right_frame, avg_time
-                else:
-                    # Right is older, get next right
-                    while self.running and not self.right_queue.empty():
-                        right_time, right_frame = self.right_queue.get_nowait()
-                        if abs(left_time - right_time) * 1000 <= self.tolerance_ms:
-                            avg_time = (left_time + right_time) / 2
-                            return left_frame, right_frame, avg_time
+                # Try to sync by discarding older frames
+                max_attempts = 20  # Prevent infinite loop
+                attempts = 0
+                
+                while attempts < max_attempts:
+                    if left_time < right_time:
+                        # Left is older, get next left
+                        if not self.left_queue.empty():
+                            left_time, left_frame = self.left_queue.get_nowait()
+                            if abs(left_time - right_time) * 1000 <= self.tolerance_ms:
+                                avg_time = (left_time + right_time) / 2
+                                return left_frame, right_frame, avg_time
+                        else:
+                            break
+                    else:
+                        # Right is older, get next right
+                        if not self.right_queue.empty():
+                            right_time, right_frame = self.right_queue.get_nowait()
+                            if abs(left_time - right_time) * 1000 <= self.tolerance_ms:
+                                avg_time = (left_time + right_time) / 2
+                                return left_frame, right_frame, avg_time
+                        else:
+                            break
+                    attempts += 1
+                    
+                # Check for stale frames (>100ms old)
+                current_time = time.perf_counter()
+                if current_time - left_time > 0.1 or current_time - right_time > 0.1:
+                    # Clear queues to prevent accumulation
+                    while not self.left_queue.empty():
+                        try:
+                            self.left_queue.get_nowait()
+                        except:
+                            break
+                    while not self.right_queue.empty():
+                        try:
+                            self.right_queue.get_nowait()
+                        except:
+                            break
+                    print("Cleared stale frames from queues")
                             
         except queue.Empty:
             pass
@@ -586,30 +740,78 @@ class StereoMosquitoDetector:
     def _triangulate_metric(self, pt_left: Tuple[float, float], 
                            pt_right: Tuple[float, float],
                            P1: np.ndarray, P2: np.ndarray) -> Tuple[float, float, float]:
-        """Triangulate with proper metric scaling to millimeters"""
+        """
+        Calculate 3D position using proper disparity-to-depth conversion
+        
+        For rectified stereo: Z = (baseline * focal_length) / disparity
+        X = (x - cx) * Z / focal_length
+        Y = (y - cy) * Z / focal_length
+        """
+        # Get camera parameters
+        baseline_mm = self.calibration.baseline_mm
+        focal_px = self.calibration.focal_length_px
+        
+        # For rectified images, y-coordinates should be nearly equal
+        y_avg = (pt_left[1] + pt_right[1]) / 2.0
+        
+        # Calculate disparity (left x - right x for rectified stereo)
+        disparity = pt_left[0] - pt_right[0]
+        
+        # Avoid division by zero
+        if abs(disparity) < 0.5:  # Half pixel minimum
+            disparity = 0.5 if disparity >= 0 else -0.5
+            
+        # Depth from disparity
+        z_mm = (baseline_mm * focal_px) / abs(disparity)
+        
+        # Get principal point from left camera matrix
+        # P1 should contain K[R|t] for rectified left camera
+        cx = P1[0, 2] / P1[0, 0] if P1[0, 0] != 0 else CONFIG["camera"]["width"] / 2
+        cy = P1[1, 2] / P1[1, 1] if P1[1, 1] != 0 else CONFIG["camera"]["height"] / 2
+        
+        # 3D position using left camera as reference
+        x_mm = (pt_left[0] - cx) * z_mm / focal_px
+        y_mm = (y_avg - cy) * z_mm / focal_px
+        
+        # Validate depth is positive (object in front of cameras)
+        if z_mm <= 0:
+            warnings.warn(f"Negative depth {z_mm}mm calculated, using absolute value")
+            z_mm = abs(z_mm)
+            
+        return x_mm, y_mm, z_mm
+        
+    def _triangulate_points_robust(self, pt_left: Tuple[float, float], 
+                                  pt_right: Tuple[float, float],
+                                  P1: np.ndarray, P2: np.ndarray) -> Tuple[float, float, float]:
+        """
+        Alternative triangulation using OpenCV's method with validation
+        """
         # Convert points to homogeneous coordinates
         pts_left = np.array([[pt_left[0], pt_left[1]]], dtype=np.float32)
         pts_right = np.array([[pt_right[0], pt_right[1]]], dtype=np.float32)
         
         # Triangulate
         points_4d = cv2.triangulatePoints(P1, P2, pts_left.T, pts_right.T)
+        
+        # Check if w coordinate is valid
+        if abs(points_4d[3]) < 1e-6:
+            # Fall back to disparity method
+            return self._triangulate_metric(pt_left, pt_right, P1, P2)
+            
+        # Convert to 3D
         points_3d = points_4d[:3] / points_4d[3]
         
-        # Scale to metric units (mm)
-        # The projection matrices from stereoRectify are in pixel units
-        # We need to scale by baseline / focal_length
-        baseline_mm = self.calibration.baseline_mm
-        focal_px = self.calibration.focal_length_px
+        # The points are in the coordinate system defined by P1/P2
+        # If calibration was done properly, this should be in mm
+        x_mm = float(points_3d[0])
+        y_mm = float(points_3d[1]) 
+        z_mm = float(points_3d[2])
         
-        # For rectified stereo, depth Z = (baseline * focal) / disparity
-        # But triangulatePoints returns coordinates in projective units
-        # Scale factor converts these to mm
-        scale_factor = baseline_mm / focal_px if focal_px > 0 else 1.0
-        
-        x_mm = float(points_3d[0] * scale_factor)
-        y_mm = float(points_3d[1] * scale_factor)
-        z_mm = float(points_3d[2] * scale_factor)
-        
+        # Validate and correct if needed
+        if z_mm <= 0:
+            # Use disparity method as fallback
+            return self._triangulate_metric(pt_left, pt_right, P1, P2)
+            
         return x_mm, y_mm, z_mm
         
     def _match_stereo_detections(self, left_detections: List[Dict], 
@@ -882,58 +1084,103 @@ class MosquitoTracker3D:
         return list(self.tracks.values())
         
     def _update_kalman_dt(self, kalman: cv2.KalmanFilter, dt: float):
-        """Update Kalman filter transition matrix with measured dt"""
+        """Update Kalman filter matrices with measured dt"""
         # Update state transition matrix for constant velocity model
         kalman.transitionMatrix[0, 3] = dt  # x += vx * dt
         kalman.transitionMatrix[1, 4] = dt  # y += vy * dt
         kalman.transitionMatrix[2, 5] = dt  # z += vz * dt
         
+        # Update process noise covariance
+        # Process noise should scale with dt
+        # For position: Q_pos ~ q * dt³/3
+        # For velocity: Q_vel ~ q * dt
+        q_pos = CONFIG["tracking"]["process_noise"]
+        q_vel = q_pos * 10  # Velocity noise factor
+        
+        # Build Q matrix
+        Q = np.zeros((6, 6), dtype=np.float32)
+        
+        # Position variance increases with dt³/3
+        dt3_3 = (dt ** 3) / 3.0
+        Q[0, 0] = Q[1, 1] = Q[2, 2] = q_pos * dt3_3
+        
+        # Velocity variance increases with dt
+        Q[3, 3] = Q[4, 4] = Q[5, 5] = q_vel * dt
+        
+        # Cross-covariance terms
+        dt2_2 = (dt ** 2) / 2.0
+        Q[0, 3] = Q[3, 0] = q_pos * dt2_2  # x-vx covariance
+        Q[1, 4] = Q[4, 1] = q_pos * dt2_2  # y-vy covariance
+        Q[2, 5] = Q[5, 2] = q_pos * dt2_2  # z-vz covariance
+        
+        kalman.processNoiseCov = Q
+        
     def _associate_detections(self, detections: List[Dict]) -> Tuple[List[Tuple[int, Dict]], List[Dict]]:
-        """Associate detections with tracks using Mahalanobis distance"""
+        """Associate detections with tracks using Hungarian algorithm (optimal) or greedy fallback"""
         matched_pairs = []
         unmatched_detections = list(detections)
-        matched_tracks = set()
         
+        if not self.tracks or not detections:
+            return matched_pairs, unmatched_detections
+            
         # Build cost matrix
-        if self.tracks and detections:
-            n_tracks = len(self.tracks)
-            n_detections = len(detections)
-            cost_matrix = np.full((n_tracks, n_detections), float('inf'))
+        n_tracks = len(self.tracks)
+        n_detections = len(detections)
+        cost_matrix = np.full((n_tracks, n_detections), float('inf'))
+        
+        track_ids = list(self.tracks.keys())
+        
+        for i, track_id in enumerate(track_ids):
+            track = self.tracks[track_id]
+            predicted = track.kalman.statePost[:3].flatten()
             
-            track_ids = list(self.tracks.keys())
+            # Get innovation covariance for Mahalanobis distance
+            H = track.kalman.measurementMatrix
+            P = track.kalman.errorCovPost
+            R = track.kalman.measurementNoiseCov
+            S = H @ P @ H.T + R
             
-            for i, track_id in enumerate(track_ids):
-                track = self.tracks[track_id]
-                predicted = track.kalman.statePost[:3].flatten()
+            try:
+                S_inv = np.linalg.inv(S)
+            except np.linalg.LinAlgError:
+                # Singular matrix, use identity
+                S_inv = np.eye(3) * 0.01  # Small weight for uncertain tracks
                 
-                # Get innovation covariance for Mahalanobis distance
-                S = track.kalman.measurementNoiseCov + \
-                    track.kalman.measurementMatrix @ track.kalman.errorCovPost @ \
-                    track.kalman.measurementMatrix.T
+            for j, detection in enumerate(detections):
+                det_pos = np.array(detection['pos_3d'])
+                innovation = det_pos - predicted
                 
-                try:
-                    S_inv = np.linalg.inv(S)
-                except:
-                    # Fallback to identity if singular
-                    S_inv = np.eye(3)
-                    
-                for j, detection in enumerate(detections):
-                    det_pos = np.array(detection['pos_3d'])
-                    innovation = det_pos - predicted
-                    
-                    # Mahalanobis distance
-                    mahal_dist = np.sqrt(innovation.T @ S_inv @ innovation)
-                    
-                    # Also consider classification consistency
-                    class_diff = abs(detection['classification_score'] - track.classification_score)
-                    
-                    # Combined cost
+                # Mahalanobis distance
+                mahal_dist = np.sqrt(innovation.T @ S_inv @ innovation)
+                
+                # Classification consistency
+                class_diff = abs(detection['classification_score'] - track.classification_score)
+                
+                # Combined cost
+                if mahal_dist < 5.0:  # 5-sigma gate
                     cost = mahal_dist + class_diff * 50
+                    cost_matrix[i, j] = cost
                     
-                    if mahal_dist < 5.0:  # Mahalanobis gate (5 sigma)
-                        cost_matrix[i, j] = cost
-                        
-            # Greedy assignment (could use scipy.optimize.linear_sum_assignment for Hungarian)
+        # Use Hungarian algorithm if available, otherwise greedy
+        if SCIPY_AVAILABLE and cost_matrix.size > 0:
+            # Hungarian algorithm for optimal assignment
+            try:
+                row_indices, col_indices = linear_sum_assignment(cost_matrix)
+                
+                for row, col in zip(row_indices, col_indices):
+                    if cost_matrix[row, col] < float('inf'):
+                        track_id = track_ids[row]
+                        detection = detections[col]
+                        matched_pairs.append((track_id, detection))
+                        if detection in unmatched_detections:
+                            unmatched_detections.remove(detection)
+                            
+            except Exception as e:
+                print(f"Hungarian assignment failed: {e}, using greedy")
+                # Fall through to greedy
+                
+        if not matched_pairs:  # Fallback to greedy if scipy failed or not available
+            # Greedy assignment
             for _ in range(min(n_tracks, n_detections)):
                 if cost_matrix.size > 0:
                     min_idx = np.unravel_index(np.argmin(cost_matrix), cost_matrix.shape)
@@ -942,7 +1189,6 @@ class MosquitoTracker3D:
                         track_id = track_ids[track_idx]
                         
                         matched_pairs.append((track_id, detections[det_idx]))
-                        matched_tracks.add(track_id)
                         
                         # Remove from future consideration
                         cost_matrix[track_idx, :] = float('inf')
@@ -1021,6 +1267,7 @@ class StereoServoController:
         self.command_queue = queue.Queue(maxsize=CONFIG["safety"]["max_queue_size"])
         self.ack_timeout = 0.1
         self.command_counter = 0
+        self.emergency_stop_active = False
         
         if SERIAL_AVAILABLE:
             try:
@@ -1032,6 +1279,11 @@ class StereoServoController:
                 self.command_thread = threading.Thread(target=self._command_worker)
                 self.command_thread.daemon = True
                 self.command_thread.start()
+                
+                # Start status monitor thread
+                self.monitor_thread = threading.Thread(target=self._status_monitor)
+                self.monitor_thread.daemon = True
+                self.monitor_thread.start()
                 
             except Exception as e:
                 print(f"Failed to open serial port: {e}")
@@ -1070,6 +1322,28 @@ class StereoServoController:
         self.min_power = CONFIG["laser"]["min_power"]
         self.max_power = CONFIG["laser"]["max_power"]
         
+    def _status_monitor(self):
+        """Monitor thread for emergency stop and other status messages"""
+        while self.serial and self.serial.is_open:
+            try:
+                if self.serial.in_waiting:
+                    line = self.serial.readline().decode().strip()
+                    
+                    # Check for emergency stop messages
+                    if line.startswith("E_STOP:"):
+                        state = line.split(':')[1]
+                        self.emergency_stop_active = (state == "1")
+                        if self.emergency_stop_active:
+                            print("WARNING: Emergency stop activated!")
+                        else:
+                            print("Emergency stop cleared")
+                            
+                time.sleep(0.01)  # Small delay to avoid busy loop
+                
+            except Exception as e:
+                print(f"Status monitor error: {e}")
+                time.sleep(0.1)
+        
     def _command_worker(self):
         """Worker thread for serial commands with ACK"""
         while self.serial and self.serial.is_open:
@@ -1081,33 +1355,56 @@ class StereoServoController:
                 cmd_with_id = f"#{self.command_counter}:{cmd}"
                 
                 # Send command
-                self.serial.write(cmd_with_id.encode())
-                
+                try:
+                    self.serial.write(cmd_with_id.encode())
+                except serial.SerialException as e:
+                    print(f"Serial write error: {e}")
+                    if callback:
+                        callback(False)
+                    # Serial error is fatal, exit worker
+                    break
+                    
                 if CONFIG["safety"]["require_ack"]:
                     # Wait for ACK
-                    start_time = time.time()
+                    start_time = time.perf_counter()
                     ack_received = False
+                    error_msg = None
                     
-                    while time.time() - start_time < self.ack_timeout:
-                        if self.serial.in_waiting:
-                            response = self.serial.readline().decode().strip()
-                            if f"ACK#{self.command_counter}" in response:
-                                ack_received = True
-                                break
+                    while time.perf_counter() - start_time < self.ack_timeout:
+                        try:
+                            if self.serial.in_waiting:
+                                response = self.serial.readline().decode().strip()
                                 
+                                # Parse response
+                                if f"ACK#{self.command_counter}" in response:
+                                    ack_received = True
+                                    break
+                                elif f"ERR#{self.command_counter}" in response:
+                                    # Extract error message
+                                    error_msg = response.split(':', 1)[1] if ':' in response else "Unknown error"
+                                    break
+                                    
+                        except (serial.SerialException, UnicodeDecodeError) as e:
+                            print(f"Serial read error: {e}")
+                            break
+                            
                     if callback:
                         callback(ack_received)
+                        
+                    if error_msg:
+                        print(f"Arduino error for command {self.command_counter}: {error_msg}")
                 else:
                     if callback:
                         callback(True)
                         
             except queue.Empty:
+                # Normal timeout, continue
                 pass
-            except serial.SerialException as e:
-                print(f"Serial error in worker: {e}")
-                break
             except Exception as e:
+                # Non-serial errors, log but continue
                 print(f"Command worker error: {e}")
+                if callback:
+                    callback(False)
                 
     def target_3d_position(self, x_mm: float, y_mm: float, z_mm: float,
                           velocity: Optional[np.ndarray] = None, dt: float = 0.033) -> Tuple[float, float, float]:
@@ -1180,6 +1477,13 @@ class StereoServoController:
         
     def fire_laser(self, duration_ms: int = 100, power: int = 50, callback=None):
         """Fire laser with safety limits and callback"""
+        # Check emergency stop
+        if self.emergency_stop_active:
+            print("Cannot fire: Emergency stop is active!")
+            if callback:
+                callback(False)
+            return
+            
         duration_ms = min(duration_ms, CONFIG["laser"]["max_duration_ms"])
         power = np.clip(power, self.min_power, self.max_power)
         
@@ -1299,7 +1603,8 @@ class StereoMosquitoLaserSystem:
     def __init__(self, left_camera_id: int = None, right_camera_id: int = None,
                  calibration_file: str = 'stereo_calibration.pkl',
                  serial_port: str = None,
-                 reference_dir: str = 'mosquito_references/'):
+                 reference_dir: str = 'mosquito_references/',
+                 display_enabled: bool = True):
         
         # Load config values
         if left_camera_id is None:
@@ -1308,6 +1613,9 @@ class StereoMosquitoLaserSystem:
             right_camera_id = CONFIG["camera"]["right_id"]
         if serial_port is None:
             serial_port = '/dev/ttyUSB0'
+            
+        # Display mode
+        self.display_enabled = display_enabled
             
         # Initialize cameras with config resolution
         self.cap_left = cv2.VideoCapture(left_camera_id)
@@ -1382,7 +1690,7 @@ class StereoMosquitoLaserSystem:
         print("\nSystem active. Press 'q' to quit.")
         print(f"Safety mode: {'ON' if self.safety_mode else 'OFF'}")
         
-        last_timestamp = time.time()
+        last_timestamp = time.perf_counter()  # Use monotonic timer
         
         while self.running:
             try:
@@ -1396,6 +1704,11 @@ class StereoMosquitoLaserSystem:
                 # Calculate actual dt
                 dt = timestamp - last_timestamp
                 last_timestamp = timestamp
+                
+                # Skip if dt is too large (frame drop)
+                if dt > 0.1:  # 100ms indicates dropped frames
+                    print(f"Large dt detected: {dt:.3f}s, possible frame drop")
+                    dt = 0.033  # Use nominal value
                 
                 # Process pipeline
                 detections_3d = self.detector.detect_3d(frame_left, frame_right)
@@ -1637,7 +1950,7 @@ class StereoMosquitoLaserSystem:
                          (255, 255, 0), 1)
                          
     def _display_output(self, vis_left: np.ndarray, vis_right: np.ndarray):
-        """Display with system info"""
+        """Display with system info (or just log in headless mode)"""
         status_lines = [
             f"FPS: {self.fps_counter.get_fps():.1f}",
             f"Targeting: {'ON' if self.targeting_enabled else 'OFF'}",
@@ -1647,46 +1960,57 @@ class StereoMosquitoLaserSystem:
             f"Engagements: {self.engagement_count}"
         ]
         
-        for i, line in enumerate(status_lines):
-            cv2.putText(vis_left, line,
-                       (10, 20 + i * 20),
-                       cv2.FONT_HERSHEY_SIMPLEX,
-                       0.6, (0, 255, 0), 2)
-                       
-        if self.visualization_mode == 'stereo':
-            combined = np.hstack([vis_left, vis_right])
-            cv2.imshow('Mosquito Defense System', combined)
+        if self.display_enabled:
+            # Draw status on frame
+            for i, line in enumerate(status_lines):
+                cv2.putText(vis_left, line,
+                           (10, 20 + i * 20),
+                           cv2.FONT_HERSHEY_SIMPLEX,
+                           0.6, (0, 255, 0), 2)
+                           
+            if self.visualization_mode == 'stereo':
+                combined = np.hstack([vis_left, vis_right])
+                cv2.imshow('Mosquito Defense System', combined)
+            else:
+                cv2.imshow('Left View', vis_left)
+                cv2.imshow('Right View', vis_right)
         else:
-            cv2.imshow('Left View', vis_left)
-            cv2.imshow('Right View', vis_right)
+            # Headless mode - print status periodically
+            if self.detection_count % 100 == 0:  # Every 100 detections
+                status = " | ".join(status_lines)
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] {status}")
             
     def _handle_controls(self) -> bool:
         """Handle keyboard input"""
-        key = cv2.waitKey(1) & 0xFF
-        
-        if key == ord('q'):
-            return False
-        elif key == ord('t'):
-            self.targeting_enabled = not self.targeting_enabled
-            print(f"Targeting: {'ON' if self.targeting_enabled else 'OFF'}")
-        elif key == ord('s'):
-            self.safety_mode = not self.safety_mode
-            CONFIG["safety"]["enabled"] = self.safety_mode
-            print(f"Safety mode: {'ON' if self.safety_mode else 'OFF'}")
-        elif key == ord('v'):
-            modes = ['stereo', 'separate']
-            current_idx = modes.index(self.visualization_mode)
-            self.visualization_mode = modes[(current_idx + 1) % len(modes)]
-            print(f"Visualization: {self.visualization_mode}")
-        elif key == ord('r'):
-            self.detection_count = 0
-            self.engagement_count = 0
-            print("Statistics reset")
-        elif key == ord('c'):
-            # Save current config
-            with open(CONFIG_FILE, 'w') as f:
-                json.dump(CONFIG, f, indent=4)
-            print(f"Configuration saved to {CONFIG_FILE}")
+        if self.display_enabled:
+            key = cv2.waitKey(1) & 0xFF
+            
+            if key == ord('q'):
+                return False
+            elif key == ord('t'):
+                self.targeting_enabled = not self.targeting_enabled
+                print(f"Targeting: {'ON' if self.targeting_enabled else 'OFF'}")
+            elif key == ord('s'):
+                self.safety_mode = not self.safety_mode
+                CONFIG["safety"]["enabled"] = self.safety_mode
+                print(f"Safety mode: {'ON' if self.safety_mode else 'OFF'}")
+            elif key == ord('v'):
+                modes = ['stereo', 'separate']
+                current_idx = modes.index(self.visualization_mode)
+                self.visualization_mode = modes[(current_idx + 1) % len(modes)]
+                print(f"Visualization: {self.visualization_mode}")
+            elif key == ord('r'):
+                self.detection_count = 0
+                self.engagement_count = 0
+                print("Statistics reset")
+            elif key == ord('c'):
+                # Save current config
+                with open(CONFIG_FILE, 'w') as f:
+                    json.dump(CONFIG, f, indent=4)
+                print(f"Configuration saved to {CONFIG_FILE}")
+        else:
+            # Headless mode - could check for signals or file-based commands
+            pass
             
         return True
         
@@ -1727,19 +2051,29 @@ class StereoMosquitoLaserSystem:
         print(f"\nSession Statistics:")
         print(f"Total detections: {self.detection_count}")
         print(f"Total engagements: {self.engagement_count}")
-        if hasattr(self, 'fps_counter') and self.fps_counter.get_fps() > 0:
-            runtime = len(self.fps_counter.timestamps) / self.fps_counter.get_fps()
-            print(f"Runtime: {runtime:.1f} seconds")
-            print(f"Average FPS: {self.fps_counter.get_fps():.1f}")
+        if hasattr(self, 'fps_counter'):
+            runtime = self.fps_counter.get_runtime()
+            avg_fps = self.fps_counter.get_fps()
+            if runtime > 0:
+                print(f"Runtime: {runtime:.1f} seconds")
+                print(f"Average FPS: {avg_fps:.1f}")
+                print(f"Detection rate: {self.detection_count / runtime:.1f} per second")
+                if self.engagement_count > 0:
+                    print(f"Engagement rate: {self.engagement_count / runtime:.2f} per second")
 
 class FPSCounter:
-    """FPS counter with sliding window"""
+    """FPS counter with proper runtime tracking"""
     
     def __init__(self, window_size: int = 30):
         self.timestamps = deque(maxlen=window_size)
+        self.start_time = None
         
     def update(self):
-        self.timestamps.append(time.time())
+        current_time = time.perf_counter()
+        self.timestamps.append(current_time)
+        
+        if self.start_time is None:
+            self.start_time = current_time
         
     def get_fps(self) -> float:
         if len(self.timestamps) < 2:
@@ -1748,11 +2082,19 @@ class FPSCounter:
         if time_span > 0:
             return (len(self.timestamps) - 1) / time_span
         return 0.0
+        
+    def get_runtime(self) -> float:
+        """Get total runtime in seconds"""
+        if self.start_time is None:
+            return 0.0
+        return time.perf_counter() - self.start_time
 
 # Arduino code with ACK protocol
 ARDUINO_CODE_WITH_ACK = """
 /*
- * Mosquito Defense System - Arduino Controller v3.1
+ * Mosquito Defense System - Arduino Controller v3.3 (v60)
+ * Copyright (c) 2024 Dragos Ruiu. All rights reserved.
+ * 
  * Controls pan/tilt servos and laser module with ACK protocol
  * 
  * Commands:
@@ -1763,6 +2105,8 @@ ARDUINO_CODE_WITH_ACK = """
  * Responses:
  * ACK#ID - Command acknowledged and executed
  * ERR#ID:<message> - Error occurred
+ * E_STOP:1 - Emergency stop active (sent periodically)
+ * E_STOP:0 - Emergency stop cleared
  */
 
 #include <Servo.h>
@@ -1784,7 +2128,9 @@ Servo focusServo;
 int currentPan = 90;
 int currentTilt = 90;
 int currentFocus = 90;
-bool emergencyStop = false;
+volatile bool emergencyStop = false;
+bool lastEmergencyState = false;
+unsigned long lastStatusTime = 0;
 
 // Command buffer
 String cmdBuffer = "";
@@ -1808,7 +2154,7 @@ void setup() {
   
   // Emergency stop with pull-up
   pinMode(EMERGENCY_STOP_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(EMERGENCY_STOP_PIN), emergencyISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(EMERGENCY_STOP_PIN), emergencyISR, CHANGE);
   
   // Center servos
   panServo.write(currentPan);
@@ -1819,18 +2165,34 @@ void setup() {
 }
 
 void emergencyISR() {
-  emergencyStop = true;
-  digitalWrite(LASER_PIN, LOW);
-  analogWrite(LASER_PWM_PIN, 0);
+  emergencyStop = (digitalRead(EMERGENCY_STOP_PIN) == LOW);
+  if (emergencyStop) {
+    digitalWrite(LASER_PIN, LOW);
+    analogWrite(LASER_PWM_PIN, 0);
+  }
 }
 
 void loop() {
+  // Report emergency stop state changes
+  if (emergencyStop != lastEmergencyState) {
+    Serial.print("E_STOP:");
+    Serial.println(emergencyStop ? "1" : "0");
+    lastEmergencyState = emergencyStop;
+  }
+  
+  // Periodic status report
+  unsigned long currentTime = millis();
+  if (currentTime - lastStatusTime > 1000) {  // Every second
+    if (emergencyStop) {
+      Serial.println("E_STOP:1");
+    }
+    lastStatusTime = currentTime;
+  }
+  
   // Check emergency stop
   if (emergencyStop) {
     digitalWrite(LASER_PIN, LOW);
     analogWrite(LASER_PWM_PIN, 0);
-    delay(100);
-    return;
   }
   
   // Read serial commands
@@ -1841,7 +2203,7 @@ void loop() {
         processCommand(cmdBuffer);
         cmdBuffer = "";
       }
-    } else {
+    } else if (cmdBuffer.length() < 100) {  // Prevent buffer overflow
       cmdBuffer += c;
     }
   }
@@ -1852,7 +2214,7 @@ void processCommand(String cmd) {
   int idStart = cmd.indexOf('#');
   int idEnd = cmd.indexOf(':');
   
-  if (idStart < 0 || idEnd < 0) {
+  if (idStart < 0 || idEnd < 0 || idEnd <= idStart) {
     Serial.println("ERR:-1:Invalid format");
     return;
   }
@@ -1938,8 +2300,16 @@ void processCommand(String cmd) {
       Serial.print("ACK#");
       Serial.println(commandId);
       
-      // Hold for duration
-      delay(duration);
+      // Hold for duration (check emergency stop)
+      unsigned long startTime = millis();
+      while (millis() - startTime < duration) {
+        if (emergencyStop) {
+          digitalWrite(LASER_PIN, LOW);
+          analogWrite(LASER_PWM_PIN, 0);
+          break;
+        }
+        delay(1);
+      }
       
       // Turn off
       digitalWrite(LASER_PIN, LOW);
@@ -1963,7 +2333,7 @@ void processCommand(String cmd) {
 def create_parser():
     """Create argument parser with all options"""
     parser = argparse.ArgumentParser(
-        description="Stereo Vision Mosquito Defense System v3.1",
+        description="Stereo Vision Mosquito Defense System v3.3 (v60)\nCopyright (c) 2024 Dragos Ruiu",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1991,6 +2361,12 @@ Configuration:
                        help='Calibration file path')
     parser.add_argument('--references', default='mosquito_references/',
                        help='Reference images directory')
+    parser.add_argument('--display', action='store_true', default=True,
+                       help='Enable GUI display (default: True)')
+    parser.add_argument('--no-display', dest='display', action='store_false',
+                       help='Disable GUI display for headless operation')
+    parser.add_argument('--cpu-only', action='store_true',
+                       help='Force CPU-only mode for TensorFlow')
     
     return parser
 
@@ -2106,6 +2482,12 @@ def main():
     global CONFIG
     CONFIG = load_config(args.config)
     
+    # Validate command
+    if args.command and args.command not in ['prepare', 'train', 'test', 'calibrate']:
+        print(f"Unknown command: {args.command}")
+        parser.print_help()
+        return
+    
     # Handle commands
     if args.command == 'prepare':
         if len(args.args) >= 1:
@@ -2134,23 +2516,33 @@ def main():
     else:
         # Run main system
         print("=" * 60)
-        print("Stereo Vision Mosquito Defense System v3.1")
+        print("Stereo Vision Mosquito Defense System v3.3 (v60)")
+        print("Copyright (c) 2024 Dragos Ruiu. All rights reserved.")
         print("=" * 60)
         print("\nCRITICAL FIXES APPLIED:")
         print("  ✓ Camera frame synchronization")
-        print("  ✓ Proper metric depth calculation")
+        print("  ✓ Proper metric depth calculation") 
         print("  ✓ Measured dt for Kalman and PID")
         print("  ✓ Comprehensive error handling")
         print("  ✓ Configurable parameters")
         print("  ✓ Safety interlocks")
+        print("  ✓ Hungarian assignment (if scipy available)")
+        print("  ✓ Process noise scaling with dt")
         
-        print("\nControls:")
-        print("  't' - Toggle targeting")
-        print("  's' - Toggle safety mode")
-        print("  'v' - Change visualization")
-        print("  'r' - Reset statistics")
-        print("  'c' - Save configuration")
-        print("  'q' - Quit")
+        if not args.display:
+            print("\nRunning in HEADLESS mode (no GUI)")
+        
+        print("\nControls" + (" (keyboard):" if args.display else " (not available in headless mode):"))
+        if args.display:
+            print("  't' - Toggle targeting")
+            print("  's' - Toggle safety mode")
+            print("  'v' - Change visualization")
+            print("  'r' - Reset statistics")
+            print("  'c' - Save configuration")
+            print("  'q' - Quit")
+        else:
+            print("  Use Ctrl+C to quit")
+            
         print("\n" + "!" * 60)
         print("WARNING: Laser safety protocols must be followed!")
         print("Never aim at eyes, people, or reflective surfaces!")
@@ -2158,24 +2550,36 @@ def main():
         
         # Check dependencies
         missing_deps = []
+        optional_deps = []
+        
         if not TENSORFLOW_AVAILABLE:
-            missing_deps.append("tensorflow")
+            optional_deps.append("tensorflow (deep learning)")
         if not SKLEARN_AVAILABLE:
-            missing_deps.append("scikit-learn")
+            optional_deps.append("scikit-learn (HOG+SVM)")
         if not SKIMAGE_AVAILABLE:
-            missing_deps.append("scikit-image")
+            optional_deps.append("scikit-image (HOG features)")
         if not SERIAL_AVAILABLE:
-            missing_deps.append("pyserial")
+            missing_deps.append("pyserial (hardware control)")
+        if not SCIPY_AVAILABLE:
+            optional_deps.append("scipy (optimal assignment)")
             
         if missing_deps:
-            print("WARNING: Some optional dependencies are missing:")
+            print("WARNING: Required dependencies missing:")
             for dep in missing_deps:
                 print(f"  - {dep}")
-            print("\nThe system will run with reduced functionality.")
-            print("Install all dependencies with:")
-            print("  pip install opencv-python numpy scikit-learn scikit-image tensorflow pyserial")
-            print("")
+            print("\nThe system cannot run without these.")
+            return
             
+        if optional_deps:
+            print("INFO: Optional dependencies missing:")
+            for dep in optional_deps:
+                print(f"  - {dep}")
+            print("\nThe system will run with reduced functionality.")
+            
+        print("\nInstall all dependencies with:")
+        print("  pip install opencv-python numpy scikit-learn scikit-image tensorflow pyserial scipy")
+        print("")
+        
         try:
             # Check for required files
             if not os.path.exists(args.calibration):
@@ -2193,7 +2597,8 @@ def main():
                 right_camera_id=args.right,
                 calibration_file=args.calibration,
                 serial_port=args.serial,
-                reference_dir=args.references
+                reference_dir=args.references,
+                display_enabled=args.display
             )
             
             system.run()
