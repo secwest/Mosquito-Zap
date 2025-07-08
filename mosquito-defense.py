@@ -5,7 +5,7 @@ Uses dual cameras for 3D positioning and deep learning for mosquito classificati
 
 VERSION 3.3 (v60) - PRODUCTION READY
 
-Copyright (c) 2024 Dragos Ruiu
+Copyright (c) 2025-07-08 Dragos Ruiu
 All rights reserved.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -2093,7 +2093,7 @@ class FPSCounter:
 ARDUINO_CODE_WITH_ACK = """
 /*
  * Mosquito Defense System - Arduino Controller v3.3 (v60)
- * Copyright (c) 2024 Dragos Ruiu. All rights reserved.
+ * Copyright (c) 2025-07-08 Dragos Ruiu. All rights reserved.
  * 
  * Controls pan/tilt servos and laser module with ACK protocol
  * 
@@ -2333,7 +2333,7 @@ void processCommand(String cmd) {
 def create_parser():
     """Create argument parser with all options"""
     parser = argparse.ArgumentParser(
-        description="Stereo Vision Mosquito Defense System v3.3 (v60)\nCopyright (c) 2024 Dragos Ruiu",
+        description="Stereo Vision Mosquito Defense System v3.3 (v60)\nCopyright (c) 2025-07-08 Dragos Ruiu",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -2517,7 +2517,7 @@ def main():
         # Run main system
         print("=" * 60)
         print("Stereo Vision Mosquito Defense System v3.3 (v60)")
-        print("Copyright (c) 2024 Dragos Ruiu. All rights reserved.")
+        print("Copyright (c) 2025-07-08 Dragos Ruiu. All rights reserved.")
         print("=" * 60)
         print("\nCRITICAL FIXES APPLIED:")
         print("  ✓ Camera frame synchronization")
